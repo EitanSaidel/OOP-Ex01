@@ -1,0 +1,231 @@
+import sys
+import csv
+import gzip
+import time
+import numpy as np
+import cv2
+EPS = 0.001
+class Volume3D:
+
+    TYPE_MAP = {
+        "uchar": np.uint8, "unsigned char": np.uint8, "uint8": np.uint8,
+        "short": np.int16, "int16": np.int16,
+        "ushort": np.uint16, "unsigned short": np.uint16, "uint16": np.uint16,
+        "int": np.int32, "int32": np.int32,
+        "uint": np.uint32, "unsigned int": np.uint32, "uint32": np.uint32,
+    }
+
+    def __init__(self, matrix: np.ndarray):
+        sx, sy, sz = matrix.shape
+        if not (1 <= sx < 1024 and 1 <= sy < 1024 and 1 <= sz < 1024):
+            raise ValueError(f"Volume dimensions {matrix.shape} out of bounds [1, 1024).")
+        self.data = self._to_uint8(matrix)
+        self.sx, self.sy, self.sz = self.data.shape
+
+    @staticmethod
+    def _to_uint8(matrix: np.ndarray) -> np.ndarray:
+        if matrix.dtype == np.uint8:
+            return np.ascontiguousarray(matrix)
+        arr = matrix.astype(np.float32)
+        min_val, max_val = float(arr.min()), float(arr.max())
+        if max_val > min_val:
+            arr = (arr - min_val) * (255.0 / (max_val - min_val))
+        return np.ascontiguousarray(arr.astype(np.uint8))
+
+    @classmethod
+    def from_nrrd(cls, filepath: str) -> "Volume3D":
+        with open(filepath, "rb") as f:
+            raw = f.read()
+        sep = b"\n\n"
+        idx = raw.find(sep)
+        if idx == -1:
+            sep = b"\r\n\r\n"
+            idx = raw.find(sep)
+        if idx == -1:
+            raise ValueError("Invalid NRRD file: missing header separator.")
+
+        header_text = raw[:idx].decode("ascii", errors="ignore")
+        payload = raw[idx + len(sep):]
+
+        header = {}
+        for line in header_text.splitlines():
+            if ":" in line and not line.startswith("#"):
+                k, v = line.split(":", 1)
+                header[k.strip().lower()] = v.strip()
+
+        sizes = [int(x) for x in header["sizes"].split()]
+        dtype = cls.TYPE_MAP.get(header["type"].lower(), np.uint16)
+        encoding = header.get("encoding", "raw").lower()
+
+        if encoding in ("gzip", "gz"):
+            payload = gzip.decompress(payload)
+
+        arr = np.frombuffer(payload, dtype=dtype)
+        matrix = arr.reshape(sizes, order="F")
+        return cls(matrix)
+
+
+class Plane:
+    def __init__(self, coords: list[float]):
+        if len(coords) == 9:
+            a = np.array(coords[0:3], dtype=np.float64)
+            b = np.array(coords[3:6], dtype=np.float64)
+            c = np.array(coords[6:9], dtype=np.float64)
+            self.a1 = a
+            self.a2 = a.copy()
+            self.b = b
+            self.c = c
+            self.is_triangle = True
+        elif len(coords) == 12:
+            self.a1 = np.array(coords[0:3], dtype=np.float64)
+            self.a2 = np.array(coords[3:6], dtype=np.float64)
+            self.b = np.array(coords[6:9], dtype=np.float64)
+            self.c = np.array(coords[9:12], dtype=np.float64)
+            self.is_triangle = False
+        else:
+            raise ValueError(f"Expected 9 or 12 coordinates per row, got {len(coords)}.")
+
+        self._validate()
+
+    def _validate(self):
+        d_a1b = float(np.linalg.norm(self.b - self.a1))
+        d_a2c = float(np.linalg.norm(self.c - self.a2))
+        d_a1a2 = float(np.linalg.norm(self.a2 - self.a1))
+        d_bc = float(np.linalg.norm(self.c - self.a2 if False else self.c - self.b))
+
+        if abs(d_a1b - d_a2c) >= EPS:
+            raise ValueError(f"Plane legs are not equal: |{d_a1b:.4f} - {d_a2c:.4f}| >= {EPS}")
+        if d_a1a2 - d_bc >= EPS:
+            raise ValueError(f"Top width ({d_a1a2:.4f}) exceeds base width ({d_bc:.4f}).")
+        if d_a1b < EPS or d_bc < EPS:
+            raise ValueError("Degenerate plane with zero dimension.")
+
+        if not self.is_triangle:
+            v1 = self.b - self.a1
+            v2 = self.c - self.a1
+            v3 = self.a2 - self.a1
+            normal = np.cross(v1, v2)
+            norm_len = float(np.linalg.norm(normal))
+            if norm_len > EPS:
+                dist_from_plane = abs(float(np.dot(v3, normal))) / norm_len
+                if dist_from_plane >= EPS:
+                    raise ValueError(f"4 points are not coplanar (offset={dist_from_plane:.5f}).")
+
+        self.d_ab = d_a1b
+        self.d_bc = d_bc
+        self.d_top = d_a1a2
+
+
+class PlaneProjector:
+
+    @staticmethod
+    def project(volume: Volume3D, plane: Plane) -> np.ndarray:
+        Dab = plane.d_ab
+        Dbc = plane.d_bc
+        h = max(1, int(round(Dab)))
+        w = max(1, int(round(Dbc)))
+
+        v_ab = (plane.b - plane.a1) / Dab
+        v_ac = (plane.c - plane.a2) / Dab
+        dp = (plane.c - plane.b) / Dbc
+
+        y_steps = np.arange(1, h + 1, dtype=np.float64)[:, None]
+        a1_rows = plane.a1 + y_steps * v_ab
+        a2_rows = plane.a2 + y_steps * v_ac
+        d12 = np.linalg.norm(a2_rows - a1_rows, axis=1)
+        x_offset = (Dbc / 2.0) - (d12 / 2.0)
+
+        x_grid = np.arange(w, dtype=np.float64)[None, :]
+        x1_grid = x_grid - x_offset[:, None]
+
+        valid_scan = (x1_grid >= -0.5) & (x1_grid <= d12[:, None] + 0.5)
+
+        p_coords = a1_rows[:, None, :] + x1_grid[:, :, None] * dp[None, None, :]
+        p_idx = np.rint(p_coords).astype(np.int32)
+
+        px = p_idx[:, :, 0]
+        py = p_idx[:, :, 1]
+        pz = p_idx[:, :, 2]
+
+        in_bounds = (
+            valid_scan
+            & (px >= 0) & (px < volume.sx)
+            & (py >= 0) & (py < volume.sy)
+            & (pz >= 0) & (pz < volume.sz)
+        )
+
+        E = np.zeros((h, w), dtype=np.uint8)
+        E[in_bounds] = volume.data[px[in_bounds], py[in_bounds], pz[in_bounds]]
+
+        return E.T
+
+
+def parse_csv(filepath: str) -> list[Plane]:
+    planes = []
+    with open(filepath, "r", newline="") as f:
+        reader = csv.reader(f)
+        for line_num, row in enumerate(reader, start=1):
+            clean = [x.strip() for x in row if x.strip() != ""]
+            if not clean:
+                continue
+            try:
+                coords = [float(x) for x in clean]
+                planes.append(Plane(coords))
+            except ValueError as e:
+                print(f"[Warning] Skipping CSV line {line_num}: {e}")
+    return planes
+
+
+def write_video(frames: list[np.ndarray], output_path: str, fps: int = 30):
+    if not frames:
+        raise ValueError("No frames to write to video.")
+
+    max_w = max(f.shape[0] for f in frames)
+    max_h = max(f.shape[1] for f in frames)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (max_w, max_h), isColor=True)
+
+    for E in frames:
+        w, h = E.shape
+        canvas = np.zeros((max_h, max_w), dtype=np.uint8)
+        y0 = (max_h - h) // 2
+        x0 = (max_w - w) // 2
+        canvas[y0:y0 + h, x0:x0 + w] = E.T
+        bgr = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
+        writer.write(bgr)
+
+    writer.release()
+
+
+def main():
+    if len(sys.argv) != 4:
+        print("Usage: python Ex0.py <file.nrrd> <file.csv> <file.mp4>")
+        sys.exit(1)
+
+    nrrd_path, csv_path, mp4_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+    print(f"Loading 3D volume from {nrrd_path}...")
+    volume = Volume3D.from_nrrd(nrrd_path)
+    print(f"Loaded volume of size {volume.sx}x{volume.sy}x{volume.sz}")
+
+    print(f"Loading planes from {csv_path}...")
+    planes = parse_csv(csv_path)
+    print(f"Validated {len(planes)} planes.")
+
+    frames = []
+    t0 = time.perf_counter()
+    for plane in planes:
+        frames.append(PlaneProjector.project(volume, plane))
+    elapsed = time.perf_counter() - t0
+
+    fps_achieved = len(planes) / elapsed if elapsed > 0 else 0.0
+    print(f"Projected {len(planes)} frames in {elapsed:.3f}s ({fps_achieved:.1f} FPS)")
+
+    print(f"Saving video to {mp4_path}...")
+    write_video(frames, mp4_path, fps=30)
+    print("Done!")
+
+
+if __name__ == "__main__":
+    main()
