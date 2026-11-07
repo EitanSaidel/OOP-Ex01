@@ -1,0 +1,33 @@
+import unittest
+import numpy as np
+from Ex0 import Volume3D, Plane, PlaneProjector
+class TestVolumePlaneProjection(unittest.TestCase):
+  def test_plane_validation_triangle(self):
+    coords = [0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 10.0, 10.0, 0.0]
+    plane = Plane(coords)
+    self.assertTrue(plane.is_triangle)
+  def test_plane_validation_trapezoid(self):
+    coords = [0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 10.0, 0.0, 0.0, 10.0, 10.0, 0.0]
+    plane = Plane(coords)
+    self.assertFalse(plane.is_triangle)
+  def test_invalid_plane_legs(self):
+    coords = [0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 10.0, 10.0, 0.0]
+    with self.assertRaises(ValueError):
+      Plane(coords)
+  def test_projection_out_of_bounds(self):
+    vol = Volume3D(np.ones((32, 32, 32), dtype=np.uint8) * 100)
+    plane = Plane([
+        100.0,
+        100.0,
+        100.0,
+        110.0,
+        100.0,
+        100.0,
+        110.0,
+        110.0,
+        100.0,
+    ])
+    E = PlaneProjector.project(vol, plane)
+    self.assertEqual(int(E.max()), 0)
+if __name__ == "__main__":
+  unittest.main()
